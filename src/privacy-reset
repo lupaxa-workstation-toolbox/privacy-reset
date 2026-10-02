@@ -1,0 +1,640 @@
+#!/usr/bin/env bash
+# privacy-reset — reset macOS privacy grants for one app or every app.
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: privacy-reset [options]
+
+  (no options)                 Interactive menu
+
+  -h, --help
+  --folder-access              Downloads, Desktop, Documents, Full Disk
+  --downloads
+  --desktop
+  --documents
+  --full-disk
+  --accessibility
+  --automation
+  --developer-tools
+  --screen-recording
+  --list-apps                  Bundle ids that already have a folder grant
+  --bundle-id ID               Target app (default: this terminal)
+  --all                        Every app (requires --yes)
+  -y, --yes
+EOF
+}
+
+require_tccutil() {
+    if ! command -v tccutil >/dev/null 2>&1; then
+        printf 'Error: tccutil was not found in PATH.\n' >&2
+        exit 1
+    fi
+}
+
+ACTION=""
+YES=0
+BUNDLE_ID=""
+ALL=0
+TARGET_NAME=""
+TARGET_BUNDLE=""
+MENU_NOTE=""
+PLIST_BUDDY="${PLIST_BUDDY:-/usr/libexec/PlistBuddy}"
+
+bundle_from_term_program() {
+    TARGET_NAME=""
+    TARGET_BUNDLE=""
+    case "$1" in
+        Apple_Terminal) TARGET_NAME="Terminal"; TARGET_BUNDLE="com.apple.Terminal" ;;
+        iTerm.app) TARGET_NAME="iTerm"; TARGET_BUNDLE="com.googlecode.iterm2" ;;
+        ghostty) TARGET_NAME="Ghostty"; TARGET_BUNDLE="com.mitchellh.ghostty" ;;
+        WarpTerminal) TARGET_NAME="Warp"; TARGET_BUNDLE="dev.warp.Warp-Stable" ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+app_bundle_from_path() {
+    local path="$1" parent=""
+    case "$path" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    while [ -n "$path" ] && [ "$path" != "/" ]; do
+        case "$path" in
+            *.app) printf '%s\n' "$path"; return 0 ;;
+        esac
+        parent="$(dirname "$path")"
+        if [ "$parent" = "$path" ]; then
+            return 1
+        fi
+        path="$parent"
+    done
+    return 1
+}
+
+read_bundle() {
+    local app="$1" plist="${1}/Contents/Info.plist" name="" id=""
+    [ -f "$plist" ] || return 1
+    id="$("$PLIST_BUDDY" -c 'Print :CFBundleIdentifier' "$plist" 2>/dev/null)" || return 1
+    [ -n "$id" ] || return 1
+    name="$("$PLIST_BUDDY" -c 'Print :CFBundleDisplayName' "$plist" 2>/dev/null)" || name=""
+    if [ -z "$name" ]; then
+        name="$("$PLIST_BUDDY" -c 'Print :CFBundleName' "$plist" 2>/dev/null)" || name=""
+    fi
+    [ -n "$name" ] || name="$id"
+    TARGET_NAME="$name"
+    TARGET_BUNDLE="$id"
+    return 0
+}
+
+detect_target() {
+    local pid="$$" hops=0 comm="" app="" parent=""
+    TARGET_NAME=""
+    TARGET_BUNDLE=""
+    while [ "$hops" -lt 32 ] && [ -n "$pid" ] && [ "$pid" != "0" ] && [ "$pid" != "1" ]; do
+        comm="$(ps -o comm= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//')" || comm=""
+        if [ -n "$comm" ]; then
+            app="$(app_bundle_from_path "$comm" || true)"
+            if [ -n "$app" ] && read_bundle "$app"; then
+                return 0
+            fi
+        fi
+        parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')" || parent=""
+        pid="$parent"
+        hops=$((hops + 1))
+    done
+    bundle_from_term_program "${TERM_PROGRAM:-}"
+}
+
+valid_bundle_id() {
+    local id="$1"
+    [ -n "$id" ] || return 1
+    case "$id" in
+        *" "*|*"	"*|-*|*"'"*) return 1 ;;
+    esac
+    return 0
+}
+
+set_action() {
+    if [ -n "$ACTION" ]; then
+        printf 'Error: only one action flag is allowed per run.\n' >&2
+        usage >&2
+        exit 2
+    fi
+    ACTION="$1"
+}
+
+parse_and_dispatch() {
+    ACTION=""
+    YES=0
+    BUNDLE_ID=""
+    ALL=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -h|--help) set_action help; shift ;;
+            -y|--yes) YES=1; shift ;;
+            --folder-access) set_action folder; shift ;;
+            --downloads) set_action downloads; shift ;;
+            --desktop) set_action desktop; shift ;;
+            --documents) set_action documents; shift ;;
+            --full-disk) set_action full_disk; shift ;;
+            --accessibility) set_action accessibility; shift ;;
+            --automation) set_action automation; shift ;;
+            --developer-tools) set_action developer_tools; shift ;;
+            --screen-recording) set_action screen_recording; shift ;;
+            --list-apps) set_action list_apps; shift ;;
+            --all) ALL=1; shift ;;
+            --bundle-id)
+                [ "$#" -ge 2 ] || { printf 'Error: invalid bundle id.\n' >&2; exit 2; }
+                BUNDLE_ID="$2"
+                shift 2
+                ;;
+            *)
+                printf 'Error: no action flag given.\n' >&2
+                usage >&2
+                exit 2
+                ;;
+        esac
+    done
+    if [ -z "$ACTION" ]; then
+        printf 'Error: no action flag given.\n' >&2
+        usage >&2
+        exit 2
+    fi
+    if [ "$ACTION" = "help" ]; then
+        usage
+        exit 0
+    fi
+    if ! valid_bundle_id "$BUNDLE_ID" && [ -n "$BUNDLE_ID" ]; then
+        printf 'Error: invalid bundle id.\n' >&2
+        exit 2
+    fi
+    if [ "$ALL" -eq 1 ] && [ -n "$BUNDLE_ID" ]; then
+        printf 'Error: --all cannot be combined with --bundle-id.\n' >&2
+        exit 2
+    fi
+    if [ "$ACTION" = "list_apps" ] && { [ "$ALL" -eq 1 ] || [ -n "$BUNDLE_ID" ]; }; then
+        printf 'Error: --list-apps does not take a target.\n' >&2
+        exit 2
+    fi
+    if [ "$ALL" -eq 1 ] && [ "$YES" -ne 1 ]; then
+        printf 'Error: resetting every app requires --yes\n' >&2
+        exit 2
+    fi
+}
+
+service_name() {
+    case "$1" in
+        downloads) printf '%s\n' SystemPolicyDownloadsFolder ;;
+        desktop) printf '%s\n' SystemPolicyDesktopFolder ;;
+        documents) printf '%s\n' SystemPolicyDocumentsFolder ;;
+        full_disk) printf '%s\n' SystemPolicyAllFiles ;;
+        accessibility) printf '%s\n' Accessibility ;;
+        automation) printf '%s\n' AppleEvents ;;
+        developer_tools) printf '%s\n' DeveloperTool ;;
+        screen_recording) printf '%s\n' ScreenCapture ;;
+        *) return 1 ;;
+    esac
+}
+
+run_tcc() {
+    local service="$1"
+    local bundle="${2:-}"
+    local status=0
+    if [ -n "$bundle" ]; then
+        printf '\n==> tccutil reset %s %s\n\n' "$service" "$bundle"
+        tccutil reset "$service" "$bundle" || status=$?
+    else
+        printf '\n==> tccutil reset %s\n\n' "$service"
+        tccutil reset "$service" || status=$?
+    fi
+    return "$status"
+}
+
+reset_folder() {
+    local bundle="${1:-}"
+    local service status=0 failed=0
+    for service in \
+        SystemPolicyDownloadsFolder \
+        SystemPolicyDesktopFolder \
+        SystemPolicyDocumentsFolder \
+        SystemPolicyAllFiles
+    do
+        status=0
+        run_tcc "$service" "$bundle" || status=$?
+        if [ "$status" -ne 0 ]; then
+            printf 'Failed: %s (status %s).\n' "$service" "$status" >&2
+            failed=$status
+        fi
+    done
+    return "$failed"
+}
+
+list_granted_bundle_ids() {
+    local db="${HOME}/Library/Application Support/com.apple.TCC/TCC.db"
+    command -v sqlite3 >/dev/null 2>&1 || return 1
+    sqlite3 "$db" "
+SELECT DISTINCT client
+FROM access
+WHERE service IN (
+  'kTCCServiceSystemPolicyDownloadsFolder',
+  'kTCCServiceSystemPolicyDesktopFolder',
+  'kTCCServiceSystemPolicyDocumentsFolder',
+  'kTCCServiceSystemPolicyAllFiles'
+)
+AND client_type = 0
+AND auth_value IN (2, 3)
+ORDER BY client;
+"
+}
+
+dispatch_action() {
+    local status=0
+    case "$ACTION" in
+        list_apps)
+            list_granted_bundle_ids || status=$?
+            if [ "$status" -ne 0 ]; then
+                printf 'Error: could not read the privacy database.\n' >&2
+                exit 1
+            fi
+            ;;
+        *)
+            finish_reset || status=$?
+            ;;
+    esac
+    return "$status"
+}
+
+finish_reset() {
+    local status=0
+    if [ "$ALL" -eq 1 ]; then
+        BUNDLE_ID=""
+    elif [ -z "$BUNDLE_ID" ]; then
+        if ! detect_target; then
+            printf 'Error: could not detect a bundle id. Pass --bundle-id.\n' >&2
+            exit 1
+        fi
+        BUNDLE_ID="$TARGET_BUNDLE"
+    fi
+    case "$ACTION" in
+        folder)
+            reset_folder "$BUNDLE_ID" || status=$?
+            ;;
+        *)
+            local service
+            service="$(service_name "$ACTION")"
+            run_tcc "$service" "$BUNDLE_ID" || status=$?
+            if [ "$status" -ne 0 ]; then
+                printf 'Command exited with status %s.\n' "$status" >&2
+            fi
+            ;;
+    esac
+    return "$status"
+}
+
+confirm() {
+    local answer
+    printf '%s [y/N]: ' "$1"
+    read -r answer || { printf '\nEOF; exiting.\n'; exit 0; }
+    case "$answer" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+pause() {
+    printf '\nPress Enter to continue...'
+    if ! read -r _; then
+        printf '\nEOF; exiting.\n'
+        exit 0
+    fi
+}
+
+read_choice() {
+    if ! read -r CHOICE; then
+        printf '\nEOF; exiting.\n'
+        exit 0
+    fi
+}
+
+service_label() {
+    case "$1" in
+        1) printf '%s\n' "folder access" ;;
+        2) printf '%s\n' "Downloads" ;;
+        3) printf '%s\n' "Desktop" ;;
+        4) printf '%s\n' "Documents" ;;
+        5) printf '%s\n' "Full Disk Access" ;;
+        6) printf '%s\n' "Accessibility" ;;
+        7) printf '%s\n' "Automation" ;;
+        8) printf '%s\n' "Developer Tools" ;;
+        9) printf '%s\n' "Screen Recording" ;;
+    esac
+}
+
+apply_choice() {
+    local choice="$1" bundle="$2" all="$3" action="" status=0
+    case "$choice" in
+        1) action=folder ;;
+        2) action=downloads ;;
+        3) action=desktop ;;
+        4) action=documents ;;
+        5) action=full_disk ;;
+        6) action=accessibility ;;
+        7) action=automation ;;
+        8) action=developer_tools ;;
+        9) action=screen_recording ;;
+        *) return 2 ;;
+    esac
+    if [ "$all" -eq 1 ]; then
+        confirm "Reset $(service_label "$choice") for every app?" || return 1
+        bundle=""
+    fi
+    if [ "$action" = "folder" ]; then
+        reset_folder "$bundle" || status=$?
+    else
+        run_tcc "$(service_name "$action")" "$bundle" || status=$?
+        if [ "$status" -ne 0 ]; then
+            printf 'Command exited with status %s.\n' "$status" >&2
+        fi
+    fi
+    if [ "$all" -eq 1 ]; then
+        printf 'Done.\nQuit and reopen the affected apps, then approve any permission prompts.\n'
+    else
+        local label="$TARGET_NAME"
+        [ -n "$label" ] || label="$bundle"
+        [ -n "$label" ] || label="the app"
+        printf 'Done.\nQuit and reopen %s, then approve any permission prompts.\n' "$label"
+    fi
+    pause
+    return 0
+}
+
+format_app_label() {
+    local id="$1" path="" app="" saved_name="$TARGET_NAME" saved_bundle="$TARGET_BUNDLE"
+    case "$id" in
+        *"'"*) printf '%s\n' "$id"; return 0 ;;
+    esac
+    # head closing the pipe must not discard a path already captured under pipefail.
+    path="$(mdfind "kMDItemCFBundleIdentifier == '${id}'" </dev/null 2>/dev/null | head -n 1)" || true
+    if [ -n "$path" ]; then
+        app="$(app_bundle_from_path "$path" || true)"
+    fi
+    if [ -n "$app" ] && read_bundle "$app"; then
+        printf '%s (%s)\n' "$TARGET_NAME" "$id"
+        TARGET_NAME="$saved_name"
+        TARGET_BUNDLE="$saved_bundle"
+        return 0
+    fi
+    TARGET_NAME="$saved_name"
+    TARGET_BUNDLE="$saved_bundle"
+    printf '%s\n' "$id"
+}
+
+begin_screen() {
+    clear || true
+    if [ -n "$MENU_NOTE" ]; then
+        printf '%s\n' "$MENU_NOTE"
+        MENU_NOTE=""
+    fi
+}
+
+print_banner() {
+    printf '%s\n' "macOS Privacy Reset" "==================="
+}
+
+print_target_header() {
+    if [ -n "$TARGET_BUNDLE" ]; then
+        printf 'Target: %s (%s)\n' "$TARGET_NAME" "$TARGET_BUNDLE"
+    else
+        printf '%s\n' "Target: unknown"
+    fi
+}
+
+print_nine() {
+    printf '%s\n' \
+        "  1) Reset folder access (Downloads, Desktop, Documents, Full Disk)" \
+        "  2) Reset Downloads" \
+        "  3) Reset Desktop" \
+        "  4) Reset Documents" \
+        "  5) Reset Full Disk Access" \
+        "  6) Reset Accessibility" \
+        "  7) Reset Automation" \
+        "  8) Reset Developer Tools" \
+        "  9) Reset Screen Recording"
+}
+
+prompt_bundle() {
+    TYPED_BUNDLE=""
+    printf 'Bundle id: '
+    if ! read -r TYPED_BUNDLE; then
+        printf '\nEOF; exiting.\n'
+        exit 0
+    fi
+    if [ -z "$TYPED_BUNDLE" ]; then
+        return 1
+    fi
+    if ! valid_bundle_id "$TYPED_BUNDLE"; then
+        MENU_NOTE="Error: invalid bundle id."
+        return 1
+    fi
+    return 0
+}
+
+begin_app_menu() {
+    local id="$1" label
+    label="$(format_app_label "$id" </dev/null)"
+    TARGET_BUNDLE="$id"
+    case "$label" in
+        *" ("*) TARGET_NAME="${label%% (*}" ;;
+        *) TARGET_NAME="$label" ;;
+    esac
+    service_menu "$id" 0 1
+}
+
+service_menu() {
+    local bundle="$1" all="$2" show_back="$3"
+    while true; do
+        begin_screen
+        print_banner
+        if [ "$all" -eq 1 ]; then
+            printf '%s\n' "These resets apply to every app."
+        else
+            print_target_header
+        fi
+        printf '\n'
+        print_nine
+        if [ "$show_back" -eq 1 ]; then
+            printf '%s\n' "  B) back"
+        fi
+        printf '\n%s\n\n%s\n' "  Q) quit" "Select an option:"
+        read_choice
+        case "$CHOICE" in
+            [Qq]|quit)
+                printf 'Goodbye.\n'
+                exit 0
+                ;;
+            [Bb])
+                if [ "$show_back" -eq 1 ]; then
+                    return 0
+                fi
+                MENU_NOTE="Invalid option: ${CHOICE}"
+                ;;
+            [1-9])
+                if [ "$all" -eq 0 ] && [ -z "$bundle" ]; then
+                    if ! prompt_bundle; then
+                        continue
+                    fi
+                    apply_choice "$CHOICE" "$TYPED_BUNDLE" 0 || true
+                else
+                    apply_choice "$CHOICE" "$bundle" "$all" || true
+                fi
+                ;;
+            *)
+                MENU_NOTE="Invalid option: ${CHOICE}"
+                ;;
+        esac
+    done
+}
+
+other_app_menu() {
+    local saved_name="$TARGET_NAME" saved_bundle="$TARGET_BUNDLE"
+    local listing="" status=0 line="" label="" n=0
+    local -a ids=()
+    while true; do
+        TARGET_NAME="$saved_name"
+        TARGET_BUNDLE="$saved_bundle"
+        ids=()
+        status=0
+        listing="$(list_granted_bundle_ids 2>/dev/null)" || status=$?
+        if [ "$status" -ne 0 ]; then
+            begin_screen
+            print_banner
+            printf '%s\n' "Could not read the privacy database. Full Disk Access is required to list apps."
+            if ! prompt_bundle; then
+                if [ -z "$TYPED_BUNDLE" ]; then
+                    TARGET_NAME="$saved_name"
+                    TARGET_BUNDLE="$saved_bundle"
+                    return 0
+                fi
+                continue
+            fi
+            begin_app_menu "$TYPED_BUNDLE"
+            continue
+        fi
+        begin_screen
+        print_banner
+        printf '%s\n\n' "Other app"
+        if [ -z "$listing" ]; then
+            printf '%s\n' "No apps with a folder grant were found."
+        else
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                ids+=("$line")
+                label="$(format_app_label "$line" </dev/null)"
+                n=${#ids[@]}
+                if [ "$n" -lt 10 ]; then
+                    printf '  %s) %s\n' "$n" "$label"
+                else
+                    printf ' %s) %s\n' "$n" "$label"
+                fi
+            done <<< "$listing"
+        fi
+        printf '%s\n' "  T) type a bundle id" "  B) back" "" "  Q) quit" "" "Select an option:"
+        read_choice
+        case "$CHOICE" in
+            [Qq]|quit)
+                printf 'Goodbye.\n'
+                exit 0
+                ;;
+            [Bb])
+                TARGET_NAME="$saved_name"
+                TARGET_BUNDLE="$saved_bundle"
+                return 0
+                ;;
+            [Tt])
+                if prompt_bundle; then
+                    begin_app_menu "$TYPED_BUNDLE"
+                fi
+                ;;
+            ''|*[!0-9]*)
+                MENU_NOTE="Invalid option: ${CHOICE}"
+                ;;
+            *)
+                if [ "$((10#$CHOICE))" -ge 1 ] && [ "$((10#$CHOICE))" -le "${#ids[@]}" ]; then
+                    begin_app_menu "${ids[$((10#$CHOICE - 1))]}"
+                else
+                    MENU_NOTE="Invalid option: ${CHOICE}"
+                fi
+                ;;
+        esac
+    done
+}
+
+all_apps_menu() {
+    service_menu "" 1 1
+}
+
+main_menu() {
+    begin_screen
+    print_banner
+    print_target_header
+    printf '\n'
+    print_nine
+    printf '%s\n' \
+        " 10) Other app…" \
+        " 11) All apps…" \
+        "" \
+        "  Q) quit" \
+        "" \
+        "Select an option:"
+    read_choice
+    case "$CHOICE" in
+        [Qq]|quit)
+            printf 'Goodbye.\n'
+            exit 0
+            ;;
+        [1-9])
+            if [ -z "$TARGET_BUNDLE" ]; then
+                if ! prompt_bundle; then
+                    return 0
+                fi
+                apply_choice "$CHOICE" "$TYPED_BUNDLE" 0 || true
+            else
+                apply_choice "$CHOICE" "$TARGET_BUNDLE" 0 || true
+            fi
+            ;;
+        10) other_app_menu ;;
+        11) all_apps_menu ;;
+        *)
+            MENU_NOTE="Invalid option: ${CHOICE}"
+            ;;
+    esac
+}
+
+main() {
+    local arg
+    if [ "$#" -eq 0 ]; then
+        require_tccutil
+        detect_target || true
+        while true; do
+            main_menu
+        done
+    fi
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+        esac
+    done
+    require_tccutil
+    parse_and_dispatch "$@"
+    dispatch_action
+    exit $?
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
