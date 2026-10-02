@@ -152,7 +152,7 @@ EOF
 }
 
 test_term_program_map() {
-    # shellcheck source=src/privacy-reset
+    # shellcheck source=src/privacy-reset disable=SC1091
     source "$SCRIPT"
     set +e
     bundle_from_term_program Apple_Terminal
@@ -182,7 +182,7 @@ else
 fi
 EOF
     chmod +x "${FAKE_DIR}/ps"
-    # shellcheck source=src/privacy-reset
+    # shellcheck source=src/privacy-reset disable=SC1091
     source "$SCRIPT"
     set +e
     PATH="${FAKE_DIR}:/usr/bin:/bin" TERM_PROGRAM=Apple_Terminal detect_target
