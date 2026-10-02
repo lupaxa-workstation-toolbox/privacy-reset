@@ -27,6 +27,16 @@ the database.
 
 ## Quick Start
 
+With Homebrew, from the public tap:
+
+```bash
+brew tap the-lupaxa-project/tap
+brew trust the-lupaxa-project/tap
+brew install privacy-reset
+```
+
+Or clone the repository and run the script:
+
 ```bash
 git clone git@github.com:lupaxa-workstation-toolbox/privacy-reset.git
 cd privacy-reset
